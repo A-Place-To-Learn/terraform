@@ -110,17 +110,33 @@ func (c *PackageCommand) Run(args []string) int {
 	services := disco.New()
 	services.SetUserAgent(httpclient.TerraformUserAgent(version.String()))
 	var sources []getproviders.MultiSourceSelector
-	sources = append(sources, getproviders.MultiSourceSelector{
-		Source: getproviders.NewMemoizeSource(getproviders.NewRegistrySource(services)),
-	})
-	// if the pluginDir exists, include it as a potential source
+
+	// Find any local providers first so we can exclude these from the registry
+	// install. We'll just silently ignore any errors and assume it would fail
+	// real installation later too.
+	var directExcluded getproviders.MultiSourceMatchingPatterns
 	if absPluginDir, err := filepath.Abs(pluginDir); err == nil {
 		if _, err := os.Stat(absPluginDir); err == nil {
+			localSource := getproviders.NewFilesystemMirrorSource(absPluginDir)
+			if available, err := localSource.AllAvailablePackages(); err == nil {
+				for found := range available {
+					directExcluded = append(directExcluded, found)
+				}
+			}
 			sources = append(sources, getproviders.MultiSourceSelector{
-				Source: getproviders.NewFilesystemMirrorSource(absPluginDir),
+				Source: localSource,
 			})
 		}
 	}
+
+	c.ui.Warn(fmt.Sprintf("excluding %#v", directExcluded))
+
+	// Add the registry source, minus any providers found in the local pluginDir.
+	sources = append(sources, getproviders.MultiSourceSelector{
+		Source:  getproviders.NewMemoizeSource(getproviders.NewRegistrySource(services)),
+		Exclude: directExcluded,
+	})
+
 	installer := providercache.NewInstaller(installdir, getproviders.MultiSource(sources))
 
 	err = c.ensureProviderVersions(installer, reqs)
@@ -162,21 +178,17 @@ func (c *PackageCommand) Run(args []string) int {
 			if err != nil {
 				return err
 			}
-			if info.IsDir() {
-				return nil
+			// maybe symlinks
+			linkPath, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return err
 			}
-			if info.Mode()&os.ModeSymlink == os.ModeSymlink {
-				linkPath, err := filepath.EvalSymlinks(path)
-				if err != nil {
-					return err
-				}
-				linkInfo, err := os.Stat(linkPath)
-				if err != nil {
-					return err
-				}
-				if linkInfo.IsDir() {
-					return nil
-				}
+			linkInfo, err := os.Stat(linkPath)
+			if err != nil {
+				return err
+			}
+			if linkInfo.IsDir() {
+				return nil
 			}
 
 			fn := info.Name()
